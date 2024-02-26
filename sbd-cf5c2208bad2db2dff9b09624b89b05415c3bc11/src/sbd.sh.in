@@ -1,0 +1,135 @@
+#!/bin/bash
+#
+# Copyright (C) 2013 Lars Marowsky-Bree <lmb@suse.com>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation; either
+# version 2 of the License, or (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+### BEGIN INIT INFO
+# Provides:             sbd
+# Required-Start:       $network $remote_fs
+# Should-Start:         $syslog iscsi multipath-tools corosync
+# X-Start-Before:       pacemaker
+# Required-Stop:        $network $remote_fs
+# Should-Stop:          iscsi multipath-tools corosync
+# X-Stop-After:         pacemaker
+# Default-Start:        2 3 4 5
+# Default-Stop:         0 1 6
+# Short-Description:    Shared-storage based fencing daemon
+# Description:          SBD provides a node fencing mechanism for
+#                       Pacemaker-based clusters through the exchange of
+#                       messages via shared block storage such as for
+#                       example a SAN, iSCSI, FCoE. It can be used as
+#                       a STONITH mechanism in all configurations that
+#                       have reliable shared storage.
+### END INIT INFO
+
+SBD_CONFIG=@CONFIGDIR@/sbd
+SBD_BIN="/usr/sbin/sbd"
+
+[ -e /lib/lsb/init-functions ] && . /lib/lsb/init-functions
+
+test -x $SBD_BIN || exit 1
+test -f $SBD_CONFIG || exit 1
+
+. $SBD_CONFIG
+
+unset LC_ALL; export LC_ALL
+unset LANGUAGE; export LANGUAGE
+
+: ${OCF_ROOT:=/usr/lib/ocf}
+: ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+. ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Construct commandline for some common options
+if [ -z "$SBD_DEVICE" ]; then
+	echo "No sbd devices defined"
+	exit 1
+fi
+SBD_DEVS=${SBD_DEVICE%;}
+SBD_DEVICE_ARGS="-d ${SBD_DEVS//;/ -d }"
+
+: ${SBD_PIDFILE:=@runstatedir@/sbd.pid}
+SBD_OPTS+=" -p $SBD_PIDFILE"
+: ${SBD_PACEMAKER:="true"}
+if ocf_is_true "$SBD_PACEMAKER" ; then
+	SBD_OPTS+=" -P"
+fi
+: ${SBD_WATCHDOG:="true"}
+if ! ocf_is_true "$SBD_WATCHDOG" ; then
+	SBD_OPTS+=" -W -W"
+fi
+if [ -n "$SBD_WATCHDOG_DEV" ]; then
+	SBD_OPTS+=" -w $SBD_WATCHDOG_DEV"
+fi
+: ${SBD_STARTMODE:="always"}
+case "$SBD_STARTMODE" in
+always) SBD_OPTS+=" -S 0" ;;
+clean) SBD_OPTS+=" -S 1" ;;
+esac
+: ${SBD_DELAY_START:="no"}
+
+start() {
+	if ! pidofproc -p $SBD_PIDFILE $SBD_BIN >/dev/null 2>&1 ; then
+		if ! $SBD_BIN $SBD_DEVICE_ARGS $SBD_OPTS watch ; then
+			echo "SBD failed to start; aborting."
+			exit 1
+		fi
+		if ocf_is_true ${SBD_DELAY_START} ; then
+			sleep $($SBD_BIN $SBD_DEVICE_ARGS dump | grep -m 1 msgwait | awk '{print $4}') 2>/dev/null
+		fi
+	else
+		return 0
+	fi
+}
+
+stop() {
+	if ! $SBD_BIN $SBD_DEVICE_ARGS -D $SBD_OPTS message LOCAL exit ; then
+		echo "SBD failed to stop; aborting."
+		exit 1
+	fi
+        while pidofproc -p $SBD_PIDFILE $SBD_BIN >/dev/null 2>&1 ; do
+                sleep 1
+        done
+}
+
+status() {
+	if pidofproc -p $SBD_PIDFILE $SBD_BIN >/dev/null 2>&1 ; then
+		echo "SBD is running."
+		return 0
+	else
+		echo "SBD is not running."
+		return 1
+	fi
+}
+
+case "$1" in
+start|stop|status)
+	$1 ;;
+restart|force-reload)
+	stop; start ;;
+*)
+	echo "Usage: $0 (start|stop|status|restart|force-reload)"
+	exit 1
+	;;
+esac
+	
+# TODO:
+# - Make openais init script call out to this script too
+# - How to handle the former "force-start" option?
+#     force-start)
+#        SBD_OPTS="$SBD_OPTS -S 0"
+#        start
+#        ;;
+
